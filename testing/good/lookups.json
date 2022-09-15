@@ -1,0 +1,23 @@
+[
+    {
+        "indexes": [
+            ["First Name", "John"]
+        ],
+        "results": [162, 1000]
+    },
+    {
+        "indexes": [
+            ["First Name", "John"],
+            ["Last Name", "Doak"]
+        ],
+        "results": [1000]
+    },
+    {
+        "indexes": [
+            ["First Name", "John"],
+            ["Last Name", "Doak"],
+            ["ID", "1000"]
+        ],
+        "results": [1000]
+    }
+]

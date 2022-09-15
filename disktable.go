@@ -104,6 +104,7 @@ import (
 	"reflect"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	// This marks the outcaste-io version, which is newer but gets rid of the values file.
@@ -165,6 +166,8 @@ func Open(pathDir string, options ...OpenOption) (*Table, error) {
 	if err := td.unmarshal(pathDir); err != nil {
 		return nil, err
 	}
+	counter := atomic.Uint64{}
+	counter.Store(td.Length)
 
 	// Open all our index tables.
 	for _, col := range td.Columns {
@@ -173,7 +176,14 @@ func Open(pathDir string, options ...OpenOption) (*Table, error) {
 		if err != nil {
 			return nil, err
 		}
-		index := &Index{Name: col.Name, AllowDuplicates: col.AllowDuplicates, db: db, buffPool: make(chan *z.Buffer, 100)}
+
+		index := &Index{
+			Name:            col.Name,
+			AllowDuplicates: col.AllowDuplicates,
+			db:              db,
+			buffPool:        make(chan *z.Buffer, 100),
+			counter:         counter,
+		}
 		table.indexes = append(table.indexes, index)
 		table.indexByName[col.Name] = index
 	}
@@ -185,21 +195,55 @@ func Open(pathDir string, options ...OpenOption) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	table.primary = &Index{Name: "primary", db: db, buffPool: make(chan *z.Buffer, 100)}
+	table.primary = &Index{
+		Name:     "primary",
+		db:       db,
+		buffPool: make(chan *z.Buffer, 100),
+		counter:  counter,
+	}
 
 	return table, nil
 }
 
 // Get gets the i'th entry stored in the table.
-func (t *Table) Get(ctx context.Context, i int64) ([]byte, error) {
-	panic("not implemented")
+func (t *Table) Get(ctx context.Context, i uint64) ([]byte, error) {
+	// The primary index is stored with the starting index as 1. Externally
+	// we use the standard starting index of 0. So we i++.
+	i++
+
+	var v []byte
+	err := t.primary.db.View(
+		func(txn *badger.Txn) error {
+			item, err := txn.Get(NumToByte(i))
+			if err != nil {
+				return err
+			}
+
+			v, err = item.ValueCopy(nil)
+			if err != nil {
+				return fmt.Errorf("problem getting value at index %d: %w", i, err)
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return v, nil
+}
+
+// Len() returns the number of entries in the table.
+func (t *Table) Len() uint64 {
+	return t.primary.counter.Load()
 }
 
 // Lookup provides the Index name and the Value that needs to match for the entry
 // to be returned.
 type Lookup struct {
+	// IndexName is the name of the index to do the lookup in.
 	IndexName string
-	Key       []byte
+	// Key is the key in the index to lookup.
+	Key []byte
 }
 
 // Result is the result of a table lookup.

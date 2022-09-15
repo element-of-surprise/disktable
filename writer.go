@@ -31,8 +31,12 @@ const dbVersion = "badger/v3"
 // by an integer, so that is not included. This only covers the other "columns" that
 // represents our indexes.
 type tableDef struct {
+	// DBVersion is the version of the DB in use.
 	DBVersion string
-	Columns   []columnDef
+	// Columns details the column information.
+	Columns []columnDef
+	// Length is the number of items in the table.
+	Length uint64
 }
 
 func (t *tableDef) marshal(pathDir string) error {
@@ -357,11 +361,24 @@ func (d *Writer) Close() error {
 			return err
 		}
 	}
+
+	for { // This logic, which looks weird, comes from the Badger documentation.
+		err := d.primary.db.RunValueLogGC(0.7)
+		if err == nil {
+			continue
+		}
+		break
+	}
+
+	if err := d.primary.db.Flatten(runtime.NumCPU()); err != nil {
+		return err
+	}
+
 	if err := d.primary.db.Close(); err != nil {
 		return err
 	}
 
-	def := tableDef{Columns: make([]columnDef, 0, len(d.indexes))}
+	def := tableDef{Columns: make([]columnDef, 0, len(d.indexes)), Length: d.primary.counter.Load()}
 
 	for _, index := range d.indexes {
 		// If we still have values to write to our indexes, do that.
@@ -390,6 +407,11 @@ func (d *Writer) Close() error {
 			}
 			break
 		}
+
+		if err := index.db.Flatten(runtime.NumCPU()); err != nil {
+			return err
+		}
+
 		if err := index.db.Close(); err != nil {
 			return err
 		}

@@ -61,8 +61,8 @@ func TestDiskFetchWrite(t *testing.T) {
 
 		i := 0
 		for scanner.Scan() {
-			uintBytes := make([]byte, 8)
 			i++
+			uintBytes := make([]byte, 8)
 			sp := strings.Split(scanner.Text(), ",")
 			firstLast := strings.Split(sp[0], " ")
 			id, err := strconv.ParseUint(sp[1], 10, 64)
@@ -93,6 +93,10 @@ func TestDiskFetchWrite(t *testing.T) {
 		table, err := Open(dir)
 		if err != nil {
 			panic(err)
+		}
+
+		if table.Len() != uint64(i) {
+			t.Errorf("TestDiskFetchWrite(%s): table.Len(): got %d, want %d", test.desc, table.Len(), i)
 		}
 
 		// Check queries and results for this test set.

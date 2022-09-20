@@ -11,13 +11,13 @@ Let's create a table with some data:
 
 	// These are our indexes on the data. AllowDuplicates allows duplicate entries
 	// in the index.
-	indexes := []*Index{
-		{Name: "First Name", AllowDuplicates: true},
-		{Name: "Last Name", AllowDuplicates: true},
-		{Name: "ID"},
+	indexes := NewIndexes(
+		&Index{Name: "First Name", AllowDuplicates: true},
+		&Index{Name: "Last Name", AllowDuplicates: true},
+		&Index{Name: "ID"},
 	}
 
-	w, err := New(dir, WithIndexes(indexes...))
+	w, err := New(dir, WithIndexes(indexes))
 	if err != nil {
 		panic(err)
 	}
@@ -27,13 +27,16 @@ Let's create a table with some data:
 		if err != nil {
 			panic(err)
 		}
-		err = w.WriteData(
-			b,
-			UnsafeGetBytes(data.First),
-			UnsafeGetBytes(data.Last),
-			NumToByte(data.ID),
+
+		insert := indexes.Insert(b).AddIndexKey(
+			"First Name", UnsafeGetBytes(data.First),
+		).AddIndexKey(
+			"Last Name", UnsafeGetBytes(data.Last),
+		).AddIndexKey(
+			"ID", NumToByte(data.ID),
 		)
-		if err != nil {
+
+		if err = w.WriteData(insert); err != nil {
 			panic(err)
 		}
 	}

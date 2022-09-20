@@ -101,6 +101,29 @@ type Writer struct {
 	logger badger.Logger
 }
 
+type Indexes struct {
+	indexes []*Index
+	mapping map[string]int
+	reverse map[int]string
+	Err     error
+}
+
+func NewIndexes(indexes ...*Index) Indexes {
+	m := map[string]int{}
+	r := map[int]string{}
+	for i, index := range indexes {
+		m[index.Name] = i
+		r[i] = index.Name
+	}
+	return Indexes{indexes: indexes, mapping: m}
+}
+
+// Insert creates an Insert type that can be used to write data to the database.
+// See Insert for more information.
+func (i Indexes) Insert(value []byte) Insert {
+	return newInsert(i, value)
+}
+
 // Index represents an index on our databse.
 type Index struct {
 	// Name of the index. This must be unique.
@@ -142,7 +165,7 @@ type WriteOption interface {
 
 // Indexes provide the indexes that will be used on this database. Can be used with:
 //   - New()
-func WithIndexes(indexes ...*Index) interface {
+func WithIndexes(indexes Indexes) interface {
 	WriteOption
 	calloptions.CallOption
 } {
@@ -157,7 +180,7 @@ func WithIndexes(indexes ...*Index) interface {
 					return fmt.Errorf("WithIndexes can only be called on New(), got %T", a)
 				}
 
-				for _, index := range indexes {
+				for _, index := range indexes.indexes {
 					if strings.TrimSpace(index.Name) != index.Name {
 						return fmt.Errorf("index name cannot have space surrounding it")
 					}
@@ -255,8 +278,8 @@ var writeOpts = badger.DefaultOptions(
 	0,
 )
 
-// New creates a new instance of our database. "dirPath" is the path to a directory that will
-// be created. This must not already exist.
+// New creates a new instance of our table store. "dirPath" is the path to a directory
+// that will be created. This must not already exist.
 func New(dirPath string, options ...WriteOption) (*Writer, error) {
 	if _, err := os.Stat(dirPath); err == nil {
 		return nil, fmt.Errorf("path %q already exists", dirPath)
@@ -420,12 +443,62 @@ func (d *Writer) Close() error {
 	return def.marshal(d.dirPath)
 }
 
+// Insert represents a data insert into the table and is created from Indexes.
+// You must use Insert.AddIndexKey() to all all index keys defined in Indexes.
+type Insert struct {
+	value   []byte
+	indexes Indexes
+	inserts [][]byte
+	Err     error
+}
+
+// NewInsert creates a new Insert for writing into the table. This is only used when
+// there are no indexes defined on the table. Otherwise you must uses Indexes.Insert().
+func NewInsert(value []byte) Insert {
+	return Insert{
+		value: value,
+	}
+}
+
+// newInsert creates a new Insert for writing into the table.
+func newInsert(indexes Indexes, value []byte) Insert {
+	return Insert{
+		value:   value,
+		indexes: indexes,
+		inserts: make([][]byte, len(indexes.indexes)),
+	}
+}
+
+// AddIndexKey adds a key for a given index. You must capture the returned
+// Insert as AddIndexKey() does not have a pointer receiver.
+func (i Insert) AddIndexKey(indexName string, key []byte) Insert {
+	k, ok := i.indexes.mapping[indexName]
+	if !ok {
+		i.Err = fmt.Errorf("indexName %q could not be found", indexName)
+		return i
+	}
+	i.inserts[k] = key
+	return i
+}
+
+func (i Insert) validate() error {
+	for k, insert := range i.inserts {
+		if len(insert) == 0 {
+			return fmt.Errorf("index(%s) was not set", i.indexes.reverse[k])
+		}
+	}
+	return nil
+}
+
 // Write data writes data to our database. indexes must be in the same order when you created
 // this DB and have the same number of indexes. You cannot reuse any "value" or "indexValues" passed until
 // all data has been written. This is because a single WriteData() does not cause data to be written.
-func (d *Writer) WriteData(value []byte, indexValues ...[]byte) error {
-	if len(indexValues) != len(d.indexList) {
-		return fmt.Errorf("indexValues size must be the same as the number of indexes created")
+func (d *Writer) WriteData(insert Insert) error {
+	if err := insert.validate(); err != nil {
+		return err
+	}
+	if insert.indexes.indexes == nil && len(d.indexList) != 0 {
+		return fmt.Errorf("cannot pass an insert that has no Indexes defined when table has indexes")
 	}
 
 	wg := sync.WaitGroup{}
@@ -438,7 +511,7 @@ func (d *Writer) WriteData(value []byte, indexValues ...[]byte) error {
 	d.writeCh <- func() {
 		defer d.wg.Done()
 		defer wg.Done()
-		if err := d.writeData(nil, value, d.primary); err != nil {
+		if err := d.writeData(nil, insert.value, d.primary); err != nil {
 			select {
 			case errCh <- err:
 			default:
@@ -446,9 +519,9 @@ func (d *Writer) WriteData(value []byte, indexValues ...[]byte) error {
 		}
 	}
 	// Write all of our index table entries.
-	for i, index := range d.indexList {
-		index := index
-		key := indexValues[i]
+	for i := 0; i < len(insert.indexes.indexes); i++ {
+		index := insert.indexes.indexes[i]
+		key := insert.inserts[i]
 
 		wg.Add(1)
 		d.wg.Add(1)

@@ -23,11 +23,11 @@ type testLookups struct {
 }
 
 func TestDiskFetchWrite(t *testing.T) {
-	indexes := []*Index{
-		{Name: "First Name", AllowDuplicates: true},
-		{Name: "Last Name", AllowDuplicates: true},
-		{Name: "ID"},
-	}
+	indexes := NewIndexes(
+		&Index{Name: "First Name", AllowDuplicates: true},
+		&Index{Name: "Last Name", AllowDuplicates: true},
+		&Index{Name: "ID"},
+	)
 
 	tests := []struct {
 		desc      string
@@ -45,7 +45,7 @@ func TestDiskFetchWrite(t *testing.T) {
 		dir := filepath.Join(os.TempDir(), "diskdb_testing")
 		os.RemoveAll(dir)
 
-		writer, err := New(dir, WithIndexes(indexes...))
+		writer, err := New(dir, WithIndexes(indexes))
 		if err != nil {
 			panic(err)
 		}
@@ -70,12 +70,12 @@ func TestDiskFetchWrite(t *testing.T) {
 				panic(err)
 			}
 			endian.PutUint64(uintBytes, id)
-			err = writer.WriteData(
-				uintBytes,
-				UnsafeGetBytes(firstLast[0]),
-				UnsafeGetBytes(firstLast[1]),
-				uintBytes,
-			)
+
+			insert := indexes.Insert(uintBytes)
+			insert = insert.AddIndexKey("First Name", UnsafeGetBytes(firstLast[0]))
+			insert = insert.AddIndexKey("Last Name", UnsafeGetBytes(firstLast[1]))
+			insert = insert.AddIndexKey("ID", uintBytes)
+			err = writer.WriteData(insert)
 
 			if err != nil && !test.writeErr {
 				t.Fatalf("TestDiskFetchWrite(%s): got write error == %q, want nil", test.desc, err)
@@ -170,7 +170,8 @@ func TestFetchAll(t *testing.T) {
 	for i := 0; i < count; i++ {
 		b := make([]byte, 8)
 		endian.PutUint32(b, uint32(i))
-		if err := writer.WriteData(b); err != nil {
+		dataOnly := NewInsert(b)
+		if err := writer.WriteData(dataOnly); err != nil {
 			panic(err)
 		}
 		expect[uint32(i)] = false

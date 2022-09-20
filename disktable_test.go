@@ -132,7 +132,7 @@ func TestDiskFetchWrite(t *testing.T) {
 				}
 				lookupArgs = append(lookupArgs, l)
 			}
-			ch, err := table.Fetch(context.Background(), lookupArgs...)
+			ch, err := table.Fetch(context.Background(), lookupArgs[0], lookupArgs[1:]...)
 			if err != nil {
 				t.Fatalf("TestDiskFetchWrite(%s): unexpected .Fetch() error: %s", test.desc, err)
 			}

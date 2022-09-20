@@ -118,6 +118,7 @@ import (
 	"github.com/dgraph-io/ristretto/z"
 	"github.com/google/btree"
 	"github.com/johnsiilver/calloptions"
+	"golang.org/x/sync/errgroup"
 )
 
 var endian = binary.BigEndian
@@ -262,88 +263,76 @@ func (a btreeItem) Less(than btree.Item) bool {
 	return a.primaryKey < b.primaryKey
 }
 
-// Fetch retrieves specifc rows that match all index lookups. You must supply at least
-// 1 lookup. You cannot currently specify multiple searches in the same index.
-// If you wish to fetch all rows, use FetchAll().
-func (t *Table) Fetch(ctx context.Context, lookup ...Lookup) (chan Result, error) {
-	indexesSearched := map[string]bool{}
+/*
+Fetch retrieves specifc rows that match all index lookups. You cannot currently
+specify multiple searches in the same index. If you wish to fetch all rows, use FetchAll().
+Here is an example:
 
-	for _, l := range lookup {
+	results, err := table.Fetch(
+		ctx,
+		Lookup{IndexName: "First Name", Key: UnsafeGetBytes("John")},
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
+	for result := range results {
+		if result.Err != nil {
+			panic(err)
+		}
+
+		entry := &pb.MyData{}
+		if err := proto.Unmarshal(entry, result.Value); err != nil {
+			panic(err)
+		}
+
+		fmt.Println("found: ", pretty.Sprint(entry))
+	}
+*/
+func (t *Table) Fetch(ctx context.Context, primary Lookup, secondaries ...Lookup) (chan Result, error) {
+	indexesSearched := map[string]bool{}
+	lookups := append(secondaries, primary)
+
+	for _, l := range lookups {
 		if t.indexByName[l.IndexName] == nil {
 			return nil, fmt.Errorf("index %q is not found", l.IndexName)
 		}
 		if indexesSearched[l.IndexName] {
 			return nil, fmt.Errorf("index %q cannot be used in a search more than once", l.IndexName)
 		}
+		if len(l.Key) == 0 {
+			return nil, fmt.Errorf("index %q lookup cannot have an empty key", l.IndexName)
+		}
 		indexesSearched[l.IndexName] = true
-	}
-
-	if len(lookup) == 0 {
-		return nil, fmt.Errorf("Fetch() requires lookups, otherwise use FetchAll()")
 	}
 
 	ch := make(chan Result, 1)
 
+	g, ctx := errgroup.WithContext(ctx)
+	mu := &sync.Mutex{}
+	matches := btree.New(2)
+
+	/*
+		TODO(jdoak): This could be made faster. Instead we could do:
+		- Look for an index with non-duplicates (if non, default to the primary Lookup)
+		- For ever match in that index, check the other indexes using a goroutine pool
+		- If they match, write to batch block (which is now a btree)
+		- If len(batch block) == 100, do a fetch and return in another goroutine
+	*/
 	go func() {
 		defer close(ch)
-
-		ctx, cancel := context.WithCancel(ctx)
-		defer cancel()
-
-		wg := sync.WaitGroup{}
-		mu := sync.Mutex{}
-		matches := btree.New(2)
-
-		// fetch all rows for each index that match our lookup constraint.
-		// Record those rows into a 2-3-4 tree. Any entry in the tree that has
-		// len(lookup) as its value is a line we want to return.
-		errCh := make(chan error, 1)
-		for _, l := range lookup {
+		for _, l := range lookups {
 			l := l
-
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for result := range t.indexLookup(l.IndexName, l.Key) {
-					if ctx.Err() != nil {
-						return
-					}
-					if result.err != nil {
-						if result.err == badger.ErrKeyNotFound {
-							continue
-						}
-						cancel()
-						select {
-						case errCh <- result.err:
-						default:
-						}
-					}
-					// Add entry to btree or increase existing entry counter.
-					mu.Lock()
-
-					var counter btreeItem
-					a := matches.Get(btreeItem{primaryKey: result.i})
-					if a == nil {
-						counter = btreeItem{primaryKey: result.i}
-					} else {
-						counter = a.(btreeItem)
-					}
-					counter.count++
-					matches.ReplaceOrInsert(counter)
-
-					mu.Unlock()
-				}
-			}()
+			g.Go(
+				func() error {
+					return t.insertResultsFromIndex(ctx, mu, l, matches)
+				},
+			)
 		}
-
-		wg.Wait()
-
-		// Did we have any errors, if so return them.
-		select {
-		case err := <-errCh:
+		if err := g.Wait(); err != nil {
 			ch <- Result{Err: err}
 			return
-		default:
 		}
 
 		keysLookup := make([][]byte, 0, 100)
@@ -352,7 +341,7 @@ func (t *Table) Fetch(ctx context.Context, lookup ...Lookup) (chan Result, error
 		matches.Ascend(
 			func(item btree.Item) bool {
 				i := item.(btreeItem)
-				if int(i.count) == len(lookup) {
+				if int(i.count) == len(lookups) {
 					primaryKey := make([]byte, 8)
 					endian.PutUint64(primaryKey, i.primaryKey)
 					keysLookup = append(keysLookup, primaryKey)
@@ -373,6 +362,35 @@ func (t *Table) Fetch(ctx context.Context, lookup ...Lookup) (chan Result, error
 	}()
 
 	return ch, nil
+}
+
+func (t *Table) insertResultsFromIndex(ctx context.Context, mu *sync.Mutex, lookup Lookup, matches *btree.BTree) error {
+	for result := range t.indexLookup(lookup.IndexName, lookup.Key) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if result.err != nil {
+			if result.err == badger.ErrKeyNotFound {
+				continue
+			}
+			return result.err
+		}
+		// Add entry to btree or increase existing entry counter.
+		mu.Lock()
+
+		var counter btreeItem
+		a := matches.Get(btreeItem{primaryKey: result.i})
+		if a == nil {
+			counter = btreeItem{primaryKey: result.i}
+		} else {
+			counter = a.(btreeItem)
+		}
+		counter.count++
+		matches.ReplaceOrInsert(counter)
+
+		mu.Unlock()
+	}
+	return nil
 }
 
 func (t *Table) retrievePrimaryRows(keys [][]byte, ch chan Result) func(txn *badger.Txn) error {
@@ -489,9 +507,50 @@ func (t *Table) multiMatch(key []byte, index *Index, ch chan lookupResult) {
 	}
 }
 
-func (t *Table) FetchAll(ctx context.Context) (chan Result, error) {
+type FetchAllOption interface {
+	fetchAll()
+}
+
+type fetchAllOptions struct {
+	numGo int
+}
+
+func (f *fetchAllOptions) defaults() {
+	if f.numGo == 0 {
+		f.numGo = 16
+	}
+}
+
+// NumStreamGoroutines sets the number of goroutines to be used in FetchAll(). By
+// default this is 16.
+func NumStreamGoroutines(n int) interface {
+	FetchAllOption
+	calloptions.CallOption
+} {
+	return struct {
+		FetchAllOption
+		calloptions.CallOption
+	}{
+		CallOption: calloptions.New(
+			func(a any) error {
+				x := a.(*fetchAllOptions)
+				x.numGo = n
+				return nil
+			},
+		),
+	}
+}
+
+// FetchAll fetches all the tables entries.
+func (t *Table) FetchAll(ctx context.Context, options ...FetchAllOption) (chan Result, error) {
+	opts := fetchAllOptions{}
+	if err := calloptions.ApplyOptions(opts, options); err != nil {
+		return nil, err
+	}
+	opts.defaults()
+
 	stream := t.primary.db.NewStream()
-	stream.NumGo = 16
+	stream.NumGo = opts.numGo
 	stream.LogPrefix = "FetchAll.Streaming"
 
 	ch := make(chan Result, 1)
@@ -525,8 +584,9 @@ func (t *Table) FetchAll(ctx context.Context) (chan Result, error) {
 	return ch, nil
 }
 
-// ByteSlice2String coverts bs to a string. It is no longer safe to use bs after this.
-// This prevents having to make a copy of bs.
+// ByteSlice2String coverts a []byte to a string without incurring the cost of a copy of
+// the given []byte parameter. This is an unsafe operation and requires that you never
+// modify the []byte slice you passed in.
 func ByteSlice2String(bs []byte) string {
 	if len(bs) == 0 {
 		return ""

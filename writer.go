@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -94,6 +95,8 @@ type Writer struct {
 
 	// wg is the number or writes that are happening.
 	wg sync.WaitGroup
+
+	writeDataMu sync.Mutex
 
 	// writeCh gives us access to a writer goroutine pool.
 	writeCh chan func()
@@ -285,7 +288,11 @@ func New(dirPath string, options ...WriteOption) (*Writer, error) {
 		return nil, fmt.Errorf("path %q already exists", dirPath)
 	}
 
-	db := &Writer{dirPath: dirPath, indexes: map[string]*Index{}, logger: nullLogger{}}
+	db := &Writer{
+		dirPath: dirPath,
+		indexes: map[string]*Index{},
+		logger:  nullLogger{},
+	}
 
 	if err := calloptions.ApplyOptions(db, options); err != nil {
 		return nil, err
@@ -369,20 +376,9 @@ func (d *Writer) Close() error {
 	d.wg.Wait()      // Wait for all writes to stop.
 	close(d.writeCh) // Kill all goroutines.
 
-	if len(d.primary.toWrite) != 0 {
-		err := d.primary.db.Update(
-			func(txn *badger.Txn) error {
-				for _, kv := range d.primary.toWrite {
-					if err := txn.Set(kv[0], kv[1]); err != nil {
-						return err
-					}
-				}
-				return nil
-			},
-		)
-		if err != nil {
-			return err
-		}
+	// Commit all our uncommitted entries for all tables.
+	if err := d.commitUncommitted(); err != nil {
+		return err
 	}
 
 	for { // This logic, which looks weird, comes from the Badger documentation.
@@ -404,23 +400,6 @@ func (d *Writer) Close() error {
 	def := tableDef{Columns: make([]columnDef, 0, len(d.indexes)), Length: d.primary.counter.Load()}
 
 	for _, index := range d.indexes {
-		// If we still have values to write to our indexes, do that.
-		if len(index.toWrite) != 0 {
-			err := index.db.Update(
-				func(txn *badger.Txn) error {
-					for _, kv := range index.toWrite {
-						if err := txn.Set(kv[0], kv[1]); err != nil {
-							return err
-						}
-					}
-					return nil
-				},
-			)
-			if err != nil {
-				return err
-			}
-		}
-
 		def.Columns = append(def.Columns, columnDef{Name: index.Name, Path: index.path, AllowDuplicates: index.AllowDuplicates})
 
 		for { // This logic, which looks weird, comes from the Badger documentation.
@@ -484,6 +463,7 @@ func (i Insert) AddIndexKey(indexName string, key []byte) Insert {
 func (i Insert) validate() error {
 	for k, insert := range i.inserts {
 		if len(insert) == 0 {
+			log.Println(i.inserts)
 			return fmt.Errorf("index(%s) was not set", i.indexes.reverse[k])
 		}
 	}
@@ -511,7 +491,11 @@ func (d *Writer) WriteData(insert Insert) error {
 	d.writeCh <- func() {
 		defer d.wg.Done()
 		defer wg.Done()
+	writePrimary:
 		if err := d.writeData(nil, insert.value, d.primary); err != nil {
+			if err == badger.ErrConflict {
+				goto writePrimary
+			}
 			select {
 			case errCh <- err:
 			default:
@@ -606,33 +590,81 @@ func (d *Writer) writeData(key, value []byte, index *Index) error {
 		endian.PutUint64(value, indexCounter)
 	}
 
-	index.toWrite = append(index.toWrite, [2][]byte{finalKeyName, value})
-	if len(index.toWrite) == 10000 {
-		txn := index.db.NewTransaction(true)
+	var toWrite [][2][]byte
 
-		for _, kv := range index.toWrite {
-			if !index.AllowDuplicates {
-				_, err := txn.Get(kv[0])
-				if err == nil {
-					txn.Discard()
-					return fmt.Errorf("index(%s) key(%s) is a duplicate, which is not allowed in that index", index.Name, string(kv[0]))
-				}
-			}
-			e := badger.NewEntry(kv[0], kv[1])
-			if err := txn.SetEntry(e); err != nil {
-				if err := txn.Commit(); err != nil {
-					txn.Discard()
-					return err
-				}
-				txn = index.db.NewTransaction(true)
-				txn.SetEntry(e)
-			}
+	d.writeDataMu.Lock()
+	index.toWrite = append(index.toWrite, [2][]byte{finalKeyName, value})
+	if len(index.toWrite) == 100000 {
+		toWrite = index.toWrite
+		index.toWrite = make([][2][]byte, 0, 100000)
+	}
+	d.writeDataMu.Unlock()
+
+	if toWrite != nil {
+		if err := transact(index.db, toWrite, !index.AllowDuplicates); err != nil {
+			return fmt.Errorf("index(%s): %w", index.Name, err)
 		}
-		if err := txn.Commit(); err != nil {
-			txn.Discard()
-			return err
-		}
-		index.toWrite = index.toWrite[0:0]
 	}
 	return nil
+}
+
+func (d *Writer) commitUncommitted() error {
+	indexes := append([]*Index{d.primary}, d.indexList...)
+
+	for _, index := range indexes {
+		if err := transact(index.db, index.toWrite, !index.AllowDuplicates); err != nil {
+			return fmt.Errorf("index(%s): %w", index.Name, err)
+		}
+	}
+	return nil
+}
+
+// transact will write all entries in toWrite into db using as many transactions
+// as required.
+func transact(db *badger.DB, toWrite [][2][]byte, checkIfExists bool) error {
+	log.Println("transacted")
+	txn := db.NewTransaction(true)
+	for _, kv := range toWrite {
+		full, err := addToTransaction(txn, kv[0], kv[1], checkIfExists)
+		if err != nil {
+			return err
+		}
+		if full {
+			if err := txn.Commit(); err != nil {
+				txn.Discard()
+				return err
+			}
+			txn = db.NewTransaction(true)
+			full, err := addToTransaction(txn, kv[0], kv[1], checkIfExists)
+			if err != nil || full {
+				return fmt.Errorf("could not add a single key/value to an empty transaction(full == %v): err == %v", full, err)
+			}
+		}
+	}
+	if err := txn.Commit(); err != nil {
+		txn.Discard()
+		return err
+	}
+	return nil
+}
+
+// addToTransaction adds a key/value to a transaction. If checkIfExists == true, will error
+// if the key already exists in the table. Returns full if the transaction is full and
+// the entry won't fit.
+func addToTransaction(txn *badger.Txn, k, v []byte, checkIfExists bool) (full bool, err error) {
+	if checkIfExists {
+		_, err := txn.Get(k)
+		if err == nil {
+			txn.Discard()
+			return false, fmt.Errorf("key(%s) is a duplicate, which is not allowed in that index", string(k))
+		}
+	}
+	e := badger.NewEntry(k, v)
+	if err := txn.SetEntry(e); err != nil {
+		if err == badger.ErrTxnTooBig {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
 }

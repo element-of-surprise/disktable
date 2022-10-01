@@ -94,6 +94,7 @@ func TestDiskFetchWrite(t *testing.T) {
 		if err != nil {
 			panic(err)
 		}
+		defer table.Close()
 
 		if table.Len() != uint64(i) {
 			t.Errorf("TestDiskFetchWrite(%s): table.Len(): got %d, want %d", test.desc, table.Len(), i)
@@ -184,6 +185,7 @@ func TestFetchAll(t *testing.T) {
 	if err != nil {
 		panic(err)
 	}
+	defer table.Close()
 
 	results, err := table.FetchAll(context.Background())
 	if err != nil {

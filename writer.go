@@ -118,7 +118,7 @@ func NewIndexes(indexes ...*Index) Indexes {
 		m[index.Name] = i
 		r[i] = index.Name
 	}
-	return Indexes{indexes: indexes, mapping: m}
+	return Indexes{indexes: indexes, mapping: m, reverse: r}
 }
 
 // Insert creates an Insert type that can be used to write data to the database.
@@ -265,8 +265,6 @@ func WithLogger(l badger.Logger) interface {
 
 var writeOpts = badger.DefaultOptions(
 	"",
-).WithBlockCacheSize(
-	2147483648,
 ).WithBypassLockGuard(
 	true,
 ).WithCompactL0OnClose(
@@ -275,10 +273,10 @@ var writeOpts = badger.DefaultOptions(
 	badgerOptions.Snappy,
 ).WithNumCompactors(
 	runtime.NumCPU(),
-).WithNumGoroutines(
-	runtime.NumCPU(),
 ).WithNumVersionsToKeep(
 	0,
+).WithIndexCacheSize(
+	-1,
 )
 
 // New creates a new instance of our table store. "dirPath" is the path to a directory
@@ -400,7 +398,12 @@ func (d *Writer) Close() error {
 	def := tableDef{Columns: make([]columnDef, 0, len(d.indexes)), Length: d.primary.counter.Load()}
 
 	for _, index := range d.indexes {
-		def.Columns = append(def.Columns, columnDef{Name: index.Name, Path: index.path, AllowDuplicates: index.AllowDuplicates})
+		relPath, err := relativePath(d.dirPath, index.path)
+		if err != nil {
+			return err
+		}
+
+		def.Columns = append(def.Columns, columnDef{Name: index.Name, Path: relPath, AllowDuplicates: index.AllowDuplicates})
 
 		for { // This logic, which looks weird, comes from the Badger documentation.
 			err := index.db.RunValueLogGC(0.7)
@@ -468,6 +471,55 @@ func (i Insert) validate() error {
 		}
 	}
 	return nil
+}
+
+// GC does garbage collection on the value log. If interested in everything it does,
+// check out badger.DB.RunValueLogGC(). A value of 0 sets to 0.5 .
+func (d *Writer) GC(discardRatio float64) {
+	if discardRatio == 0 {
+		discardRatio = 0.5
+	}
+	dbs := []*badger.DB{d.primary.db}
+	for _, i := range d.indexes {
+		dbs = append(dbs, i.db)
+	}
+	wg := sync.WaitGroup{}
+	for _, db := range dbs {
+		db := db
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for { // This logic, which looks weird, comes from the Badger documentation.
+				err := db.RunValueLogGC(discardRatio)
+				if err == nil {
+					continue
+				}
+				break
+			}
+		}()
+	}
+	wg.Wait()
+
+}
+
+// Flatten flattens the LSM tree.
+func (d *Writer) Flatten() {
+	dbs := []*badger.DB{d.primary.db}
+	for _, i := range d.indexes {
+		dbs = append(dbs, i.db)
+	}
+	wg := sync.WaitGroup{}
+	for _, db := range dbs {
+		db := db
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := db.Flatten(runtime.NumCPU()); err != nil {
+				log.Println("flatten error: ", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // Write data writes data to our database. indexes must be in the same order when you created
@@ -591,7 +643,6 @@ func (d *Writer) writeData(key, value []byte, index *Index) error {
 	}
 
 	var toWrite [][2][]byte
-
 	d.writeDataMu.Lock()
 	index.toWrite = append(index.toWrite, [2][]byte{finalKeyName, value})
 	if len(index.toWrite) == 100000 {
@@ -622,7 +673,6 @@ func (d *Writer) commitUncommitted() error {
 // transact will write all entries in toWrite into db using as many transactions
 // as required.
 func transact(db *badger.DB, toWrite [][2][]byte, checkIfExists bool) error {
-	log.Println("transacted")
 	txn := db.NewTransaction(true)
 	for _, kv := range toWrite {
 		full, err := addToTransaction(txn, kv[0], kv[1], checkIfExists)
@@ -667,4 +717,12 @@ func addToTransaction(txn *badger.Txn, k, v []byte, checkIfExists bool) (full bo
 		return false, err
 	}
 	return false, nil
+}
+
+func relativePath(basepath, targpath string) (string, error) {
+	rel, err := filepath.Rel(basepath, targpath)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(rel), nil
 }

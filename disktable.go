@@ -175,7 +175,9 @@ func Open(pathDir string, options ...OpenOption) (*Table, error) {
 
 	// Open all our index tables.
 	for _, col := range td.Columns {
-		badgeOpts := readOpts.WithDir(col.Path).WithValueDir(col.Path).WithLogger(table.logger)
+		p := filepath.Join(pathDir, col.Path)
+
+		badgeOpts := readOpts.WithDir(p).WithValueDir(p).WithLogger(table.logger)
 		db, err := badger.Open(badgeOpts)
 		if err != nil {
 			return nil, err
@@ -207,6 +209,18 @@ func Open(pathDir string, options ...OpenOption) (*Table, error) {
 	}
 
 	return table, nil
+}
+
+// Close closes all the databases.
+func (t *Table) Close() error {
+	err := t.primary.db.Close()
+
+	for _, index := range t.indexes {
+		if e := index.db.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
 }
 
 // Get gets the i'th entry stored in the table.
